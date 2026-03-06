@@ -43,7 +43,7 @@ Namespace: `brain::ui`
 
 ### Core types
 
-- `enum class PotBehavior : uint8_t`
+- `enum class PotMode : uint8_t`
   - `kDirect`       // direct map from pot value
   - `kPickup`       // algorithm 1
   - `kValueScale`   // algorithm 2
@@ -54,7 +54,7 @@ Namespace: `brain::ui`
   - `int32_t min_value`
   - `int32_t max_value`
   - `int32_t initial_value`
-  - `PotBehavior behavior`
+  - `PotMode mode`
   - `uint8_t pickup_hysteresis`        // small deadband (e.g. 1-2 steps)
 
 - `class PotMultiFunction`
@@ -152,7 +152,7 @@ This solves the “constantly changing upper/lower ranges” problem by freezing
 - Add migration notes for existing firmwares.
 
 ## Test plan (host-side)
-Create deterministic tests under `sdk_test`:
+Create deterministic tests under `sandbox`:
 - registration/context routing
 - pickup lock/unlock/crossing behavior
 - value-scale convergence in both directions

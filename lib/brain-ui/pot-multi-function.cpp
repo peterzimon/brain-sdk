@@ -41,7 +41,7 @@ bool PotMultiFunction::register_function(const PotFunctionConfig& config) {
 		functions_[i].min_value = config.min_value;
 		functions_[i].max_value = config.max_value;
 		functions_[i].value = clamp_value(functions_[i], config.initial_value);
-		functions_[i].behavior = config.behavior;
+		functions_[i].mode = config.mode;
 		functions_[i].pickup_hysteresis = config.pickup_hysteresis;
 		functions_[i].changed = false;
 		functions_[i].picked_up = false;
@@ -87,25 +87,25 @@ void PotMultiFunction::update(Pots& pots) {
 			previous_active_function_per_pot_[pot_index] = function_id;
 		}
 
-		switch (state.behavior) {
-			case PotBehavior::kPickup:
+		switch (state.mode) {
+			case PotMode::kPickup:
 				update_pickup(state, raw);
+				state.last_raw = raw;
 				break;
-			case PotBehavior::kValueScale:
+			case PotMode::kValueScale:
 				update_value_scale(state, raw);
 				break;
-			case PotBehavior::kDirect: {
+			case PotMode::kDirect: {
 				int32_t mapped = map_raw_to_range(state, raw);
 				mapped = clamp_value(state, mapped);
 				if (mapped != state.value) {
 					state.value = mapped;
 					state.changed = true;
 				}
+				state.last_raw = raw;
 				break;
 			}
 		}
-
-		state.last_raw = raw;
 	}
 }
 
@@ -156,13 +156,13 @@ uint16_t PotMultiFunction::read_raw_for_function(Pots& pots, const FunctionState
 
 void PotMultiFunction::on_function_activated(FunctionState& state, uint16_t raw) {
 	state.last_raw = raw;
-	if (state.behavior == PotBehavior::kPickup) {
+	if (state.mode == PotMode::kPickup) {
 		int32_t mapped = map_raw_to_range(state, raw);
 		int32_t diff = mapped - state.value;
 		if (diff < 0) diff = -diff;
 		state.picked_up = (diff <= state.pickup_hysteresis);
 	}
-	if (state.behavior == PotBehavior::kValueScale) {
+	if (state.mode == PotMode::kValueScale) {
 		state.accumulator_q16 = state.value << 16;
 		state.scale_direction = 0;
 		state.scale_anchor_raw = raw;
@@ -197,7 +197,35 @@ void PotMultiFunction::update_pickup(FunctionState& state, uint16_t raw) {
 
 void PotMultiFunction::update_value_scale(FunctionState& state, uint16_t raw) {
 	static constexpr uint16_t kRawMax = 255;
+	static constexpr uint16_t kNoiseDeadband = 2;
+	static constexpr uint16_t kEdgeSnapThreshold = 2;
+	static constexpr uint16_t kHighEdgeStart = kRawMax - kEdgeSnapThreshold;
+
 	if (raw == state.last_raw) return;
+
+	// Force deterministic endpoints only when crossing from interior to edge.
+	// This avoids immediate snapping on function switch when the pot already sits at an edge.
+	if (raw <= kEdgeSnapThreshold && state.last_raw > kEdgeSnapThreshold) {
+		if (state.value != state.min_value) {
+			state.value = state.min_value;
+			state.changed = true;
+		}
+		state.accumulator_q16 = state.value << 16;
+		state.last_raw = raw;
+		return;
+	}
+	if (raw >= kHighEdgeStart && state.last_raw < kHighEdgeStart) {
+		if (state.value != state.max_value) {
+			state.value = state.max_value;
+			state.changed = true;
+		}
+		state.accumulator_q16 = state.value << 16;
+		state.last_raw = raw;
+		return;
+	}
+
+	uint16_t raw_delta = (raw > state.last_raw) ? (raw - state.last_raw) : (state.last_raw - raw);
+	if (raw_delta <= kNoiseDeadband) return;
 
 	int8_t direction = (raw > state.last_raw) ? 1 : -1;
 	if (direction != state.scale_direction) {
@@ -218,19 +246,30 @@ void PotMultiFunction::update_value_scale(FunctionState& state, uint16_t raw) {
 		if (raw_runway == 0 || value_runway <= 0) {
 			state.scale_step_q16 = 0;
 		} else {
-			state.scale_step_q16 = (static_cast<uint32_t>(value_runway) << 16) / raw_runway;
+			// Rounded fixed-point step to reduce directional quantization bias.
+			state.scale_step_q16 =
+				((static_cast<uint32_t>(value_runway) << 16) + (raw_runway / 2)) / raw_runway;
 		}
 	}
 
-	if (state.scale_step_q16 == 0) return;
-
-	uint16_t raw_delta = (raw > state.last_raw) ? (raw - state.last_raw) : (state.last_raw - raw);
-	uint32_t delta_q16 = raw_delta * state.scale_step_q16;
-	if (direction > 0) {
-		state.accumulator_q16 += static_cast<int32_t>(delta_q16);
-	} else {
-		state.accumulator_q16 -= static_cast<int32_t>(delta_q16);
+	if (state.scale_step_q16 == 0) {
+		state.last_raw = raw;
+		return;
 	}
+
+	uint64_t delta_q16 = static_cast<uint64_t>(raw_delta) * state.scale_step_q16;
+	int64_t accumulator_q16 = state.accumulator_q16;
+	if (direction > 0) {
+		accumulator_q16 += static_cast<int64_t>(delta_q16);
+	} else {
+		accumulator_q16 -= static_cast<int64_t>(delta_q16);
+	}
+
+	const int64_t min_q16 = static_cast<int64_t>(state.min_value) << 16;
+	const int64_t max_q16 = static_cast<int64_t>(state.max_value) << 16;
+	if (accumulator_q16 < min_q16) accumulator_q16 = min_q16;
+	if (accumulator_q16 > max_q16) accumulator_q16 = max_q16;
+	state.accumulator_q16 = static_cast<int32_t>(accumulator_q16);
 
 	int32_t rounded = (state.accumulator_q16 >= 0)
 		? ((state.accumulator_q16 + (1 << 15)) >> 16)
@@ -240,7 +279,7 @@ void PotMultiFunction::update_value_scale(FunctionState& state, uint16_t raw) {
 		state.value = clamped;
 		state.changed = true;
 	}
-	state.accumulator_q16 = state.value << 16;
+	state.last_raw = raw;
 }
 
 }  // namespace brain::ui
